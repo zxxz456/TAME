@@ -216,3 +216,9 @@ __marimo__/
 
 *events*
 *.pt
+
+# Manuscript and reviewer files - not for public repo
+*.pdf
+*.tex
+*.doc
+*.docx
