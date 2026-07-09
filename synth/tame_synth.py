@@ -56,42 +56,63 @@ def tame_synthesize(data, config):
     syn_data = torch.randn((num_classes * ipc, input_dim), device=device, requires_grad=True)
     label_syn = torch.arange(num_classes, device=device).repeat_interleave(ipc)
 
+    # optional decoupling of init from the optimization-path RNG stream:
+    # a fixed init_seed makes the starting subset identical across runs
+    init_seed = config.get("init_seed", None)
     with torch.no_grad():
-        for c in range(num_classes):
-            syn_data[c * ipc:(c + 1) * ipc] = get_real_batch(c, ipc)
+        if init_seed is not None:
+            init_rng = np.random.default_rng(int(init_seed))
+            for c in range(num_classes):
+                idx = indices_class[c]
+                take = init_rng.choice(idx, ipc, replace=len(idx) < ipc)
+                syn_data[c * ipc:(c + 1) * ipc] = X_train[take]
+        else:
+            for c in range(num_classes):
+                syn_data[c * ipc:(c + 1) * ipc] = get_real_batch(c, ipc)
 
     optimizer = torch.optim.SGD([syn_data], lr=lr, momentum=0.5)
+
+    # number of random embedder views per iteration; losses are averaged
+    # over views so the lr scale is unchanged vs the single-view default
+    views = int(config.get("dm_views", 1))
+
+    # optional snapshot trail for checkpoint-selection studies
+    snapshot_every = int(config.get("snapshot_every", 0))
+    snapshots = []
+    if snapshot_every:
+        snapshots.append((-1, syn_data.detach().clone()))  # the init subset
 
     best_loss = float("inf")
     best_it = -1
     best_syn = syn_data.detach().clone()
 
     for it in range(iters + 1):
-        embed_net = sample_random_embedder(
-            embedder_type, embedder_size, input_dim, embed_hidden, embed_dim, device
-        )
-        embed_net.eval()
-
         optimizer.zero_grad(set_to_none=True)
 
         loss_mean = torch.zeros((), device=device)
         loss_cov = torch.zeros((), device=device)
 
-        for c in range(num_classes):
-            real_b = get_real_batch(c, batch_real)
-            syn_b = syn_data[c * ipc:(c + 1) * ipc]
+        for _ in range(views):
+            embed_net = sample_random_embedder(
+                embedder_type, embedder_size, input_dim, embed_hidden, embed_dim, device
+            )
+            embed_net.eval()
 
-            feat_real = embed_net(real_b).detach()
-            feat_syn = embed_net(syn_b)
+            for c in range(num_classes):
+                real_b = get_real_batch(c, batch_real)
+                syn_b = syn_data[c * ipc:(c + 1) * ipc]
 
-            mu_r, cov_r = cov_matrix(feat_real, eps)
-            mu_s, cov_s = cov_matrix(feat_syn, eps)
+                feat_real = embed_net(real_b).detach()
+                feat_syn = embed_net(syn_b)
 
-            loss_mean = loss_mean + ((mu_r - mu_s) ** 2).sum()
-            diff = cov_r - cov_s
-            loss_cov = loss_cov + cov_weight * (diff * diff).sum()
+                mu_r, cov_r = cov_matrix(feat_real, eps)
+                mu_s, cov_s = cov_matrix(feat_syn, eps)
 
-        loss_total = loss_mean + loss_cov
+                loss_mean = loss_mean + ((mu_r - mu_s) ** 2).sum()
+                diff = cov_r - cov_s
+                loss_cov = loss_cov + cov_weight * (diff * diff).sum()
+
+        loss_total = (loss_mean + loss_cov) / views
 
         cur = float((loss_total / num_classes).detach().item())
         if np.isfinite(cur) and cur < best_loss:
@@ -103,6 +124,9 @@ def tame_synthesize(data, config):
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_([syn_data], grad_clip)
             optimizer.step()
+
+        if snapshot_every and it % snapshot_every == 0:
+            snapshots.append((it, syn_data.detach().clone()))
 
         if it % 100 == 0:
             print(
@@ -119,4 +143,6 @@ def tame_synthesize(data, config):
             os.path.join(save_dir, "best_syn.pt"),
         )
 
+    if config.get("return_snapshots", False):
+        return best_syn, label_syn.detach(), snapshots
     return best_syn, label_syn.detach()

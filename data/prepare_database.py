@@ -246,12 +246,12 @@ def prepare_bank_marketing(random_seed=42, device="cpu"):
 
     # Text labels ("yes"/"no")
     if uniques <= {"yes", "no"}:
-        print("Detected yes/no → mapping: yes=1, no=0")
+        print("Detected yes/no -> mapping: yes=1, no=0")
         y = (raw == "yes").astype(int).values
 
     # Numeric labels ("1"/"2")
     elif uniques <= {"1", "2"}:
-        print("Detected numeric labels 1/2 → mapping: 2=1, 1=0")
+        print("Detected numeric labels 1/2 -> mapping: 2=1, 1=0")
         y = (raw == "2").astype(int).values
 
     else:
@@ -1440,6 +1440,94 @@ def prepare_climate_model_simulation_crashes(random_seed=42, device="cpu", debug
     }
 
 
+def _finalize_numeric_dataset(X, y, name, random_seed, device):
+    """Shared tail for the revision datasets: median-fill NaNs,
+    70/15/15 stratified split, standardize, tensors."""
+    X = np.asarray(X, dtype=np.float32)
+    col_med = np.nanmedian(X, axis=0)
+    col_med = np.where(np.isfinite(col_med), col_med, 0.0)
+    nan_mask = ~np.isfinite(X)
+    if nan_mask.any():
+        X[nan_mask] = np.take(col_med, np.where(nan_mask)[1])
+    y = np.asarray(y, dtype=np.int64)
+
+    print(f"{name}: {len(X)} samples | dim={X.shape[1]} | "
+          f"classes={len(np.unique(y))}")
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.30, stratify=y, random_state=random_seed
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=random_seed
+    )
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train).astype(np.float32)
+    X_val = scaler.transform(X_val).astype(np.float32)
+    X_test = scaler.transform(X_test).astype(np.float32)
+
+    return {
+        "X_train": torch.tensor(X_train, device=device),
+        "y_train": torch.tensor(y_train, device=device, dtype=torch.long),
+        "X_val":   torch.tensor(X_val, device=device),
+        "y_val":   torch.tensor(y_val, device=device, dtype=torch.long),
+        "X_test":  torch.tensor(X_test, device=device),
+        "y_test":  torch.tensor(y_test, device=device, dtype=torch.long),
+        "input_dim": int(X.shape[1]),
+        "num_classes": int(len(np.unique(y))),
+    }
+
+
+
+
+def prepare_higgs_1m(random_seed=42, device="cpu"):
+    """
+    HIGGS, 940k-row curated version (OpenML id=44129, tabular-benchmark
+    copy; the 1M original id=42769 has a broken server-side checksum).
+    24 numeric physics features, binary, balanced (50/50). ~10x the 98k
+    'higgs' subset already in the benchmark.
+    """
+    print("Loading HIGGS-1M dataset (OpenML id=44129)...")
+    X, y = fetch_openml(data_id=44129, return_X_y=True,
+                        as_frame=True, parser="auto")
+    X = X.apply(pd.to_numeric, errors="coerce").values
+    y = np.asarray(y).astype(str)
+    print("Raw label values:", sorted(set(np.unique(y)))[:4])
+    try:
+        y = y.astype(np.float64).astype(np.int64)
+    except ValueError:
+        y = (y == sorted(set(np.unique(y)))[-1]).astype(np.int64)
+    return _finalize_numeric_dataset(X, y, "HIGGS-1M", random_seed, device)
+
+
+def prepare_airline_satisfaction(random_seed=42, device="cpu"):
+    """
+    Customer Satisfaction in Airline (OpenML id=46920, from TabArena-v0.1).
+    129,880 samples, 21 mixed features (mostly categorical/ordinal), binary,
+    balanced (54.7/45.3).
+    """
+    print("Loading AirlineSatisfaction dataset (OpenML id=46920)...")
+    X, y = fetch_openml(data_id=46920, return_X_y=True,
+                        as_frame=True, parser="auto")
+    # mixed categorical/numeric: one-hot low-cardinality, code high-cardinality
+    for col in X.columns:
+        if X[col].dtype.name in ("category", "object", "bool"):
+            X[col] = X[col].astype("category")
+            if X[col].nunique() <= 10:
+                dummies = pd.get_dummies(X[col], prefix=col, dummy_na=False)
+                X = X.drop(columns=[col])
+                X = pd.concat([X, dummies], axis=1)
+            else:
+                X[col] = X[col].cat.codes
+    X = X.apply(pd.to_numeric, errors="coerce").values
+    y = np.asarray(y).astype(str)
+    print("Raw label values:", sorted(set(np.unique(y))))
+    y = (y == "satisfied").astype(np.int64)
+    return _finalize_numeric_dataset(X, y, "AirlineSatisfaction",
+                                     random_seed, device)
+
+
+
 DATASET_REGISTRY = {}
 
 DATASET_REGISTRY["phishing"] = prepare_phishing_websites
@@ -1460,6 +1548,8 @@ DATASET_REGISTRY["german"] = prepare_credit_g
 DATASET_REGISTRY["airlines"] = prepare_airlines_optimized
 DATASET_REGISTRY["higgs"] = prepare_higgs
 DATASET_REGISTRY["madelon"] = prepare_madelon
+DATASET_REGISTRY["airline_satisfaction"] = prepare_airline_satisfaction
+DATASET_REGISTRY["higgs_1m"] = prepare_higgs_1m
 
 def prepare_db(config, name):
     seed = config["random_seed"]

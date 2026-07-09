@@ -121,27 +121,40 @@ def _preprocess_and_split(X_df, y, random_seed, device,
     }
 
 
-def _fetch_openml_safe(openml_id):
+def _fetch_openml_safe(openml_id, retries=3, backoff=30):
     """Fetch from OpenML, returns (X_df, y_series).
 
     Tries the `openml` package first (more reliable with current API),
-    falls back to sklearn.datasets.fetch_openml.
+    falls back to sklearn.datasets.fetch_openml. OpenML's API throws
+    transient "not found" errors under load, so retry with backoff
+    before giving up.
     """
-    if _HAS_OPENML:
-        ds = openml.datasets.get_dataset(
-            openml_id,
-            download_data=True,
-            download_qualities=False,
-            download_features_meta_data=False,
-        )
-        X_df, y, _, _ = ds.get_data(
-            target=ds.default_target_attribute,
-            dataset_format="dataframe",
-        )
-        return X_df, y
-    else:
-        d = fetch_openml(data_id=openml_id, as_frame=True)
-        return d.data, d.target
+    import time as _time
+    last_err = None
+    for attempt in range(retries):
+        try:
+            if _HAS_OPENML:
+                ds = openml.datasets.get_dataset(
+                    openml_id,
+                    download_data=True,
+                    download_qualities=False,
+                    download_features_meta_data=False,
+                )
+                X_df, y, _, _ = ds.get_data(
+                    target=ds.default_target_attribute,
+                    dataset_format="dataframe",
+                )
+                return X_df, y
+            else:
+                d = fetch_openml(data_id=openml_id, as_frame=True)
+                return d.data, d.target
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                print(f"  [openml {openml_id}] fetch failed "
+                      f"({type(e).__name__}), retry in {backoff}s ...")
+                _time.sleep(backoff)
+    raise last_err
 
 
 # --- the 16 new TDBench-only datasets ---

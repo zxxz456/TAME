@@ -222,3 +222,11 @@ __marimo__/
 *.tex
 *.doc
 *.docx
+
+# Regenerable experiment outputs
+results_*/
+
+# Run logs
+*_log.txt
+_manuscript_dump.txt
+grammar_errors.txt
