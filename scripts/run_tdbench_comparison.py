@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 from sklearn.metrics import balanced_accuracy_score
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.prepare_database import prepare_db, DATASET_REGISTRY
 from data.tdbench_datasets import register_tdbench_datasets, TDBENCH_NAMES

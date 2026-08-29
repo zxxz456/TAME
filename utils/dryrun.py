@@ -19,7 +19,9 @@ import traceback
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# dryrun.py lives in utils/, but the packages it imports (data, models,
+# synth, eval) sit at the repo root -- go up one level
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.prepare_database import prepare_db, DATASET_REGISTRY
 from models.classifiers import CLASSIFIER_REGISTRY
