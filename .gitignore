@@ -230,3 +230,5 @@ results_*/
 *_log.txt
 _manuscript_dump.txt
 grammar_errors.txt
+# Bitacora personal de investigacion: local, no se versiona
+/notes/
