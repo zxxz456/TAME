@@ -751,6 +751,32 @@ EMBEDDER_REGISTRY = {
 }
 
 def build_embedder(name: str, **kwargs):
+    """Instantiate an embedder class by its registry name
+
+    Looks ``name`` up in ``EMBEDDER_REGISTRY`` and calls the class it maps to,
+    forwarding ``kwargs`` untouched to the constructor. That is the whole
+    function: a dictionary lookup plus a call, wrapped in a readable error
+
+    Parameters
+    ----------
+    name : str
+        Key in ``EMBEDDER_REGISTRY``.
+    **kwargs
+        Constructor arguments for that class. Passed through as-is, so they must
+        match the target signature exactly; a wrong or missing argument surfaces
+        as a TypeError from the constructor, not from here
+
+    Returns
+    -------
+    nn.Module
+        A fresh instance, on CPU, in train mode, with gradients enabled. Callers
+        that want a frozen feature map must do that themselves
+
+    Raises
+    ------
+    ValueError
+        If ``name`` is not registered. The message lists the valid keys
+    """
     if name not in EMBEDDER_REGISTRY:
         raise ValueError(
             f"Unknown embedder '{name}'. "
@@ -768,6 +794,51 @@ def sample_random_embedder(
     *,
     overrides: dict | None = None,
 ):
+    """Build a frozen, randomly initialised projection network on ``device``
+
+    Resolves ``embedder_type`` to a class in ``EMBEDDER_REGISTRY``, reads the
+    ``embedder_size`` rung from ``SIZE_LADDERS`` to obtain the architecture
+    hyperparameters, translates them into the constructor arguments that family
+    expects, instantiates the network with new random weights, disables
+    gradients on every parameter, and returns it in eval mode
+
+    The result maps ``(batch, input_dim)`` to ``(batch, embed_dim)`` and is
+    ready to use as a fixed feature map: it is never trained, and TAME discards
+    it after a single iteration, so a full run builds ``dm_iters * dm_views``
+    such networks and trains none of them
+
+    Parameters
+    ----------
+    embedder_type : str
+        Architecture key. Must be present in ``SIZE_LADDERS``, which currently
+        covers only "ln_res_l", "dcnv2_base" and "node" even though
+        ``EMBEDDER_REGISTRY`` holds fifteen entries. The other twelve are
+        unreachable through this path and raise ValueError.
+    embedder_size : str
+        Size rung: "tiny", "small", "base", "large" or "xl".
+    input_dim : int
+        Feature count of the dataset, after encoding.
+    hidden : int
+        Base hidden width, scaled by the rung's ``hidden_mul``. Ignored by NODE,
+        which sizes itself from ``embed_dim``.
+    embed_dim : int
+        Output dimension. Keep it below IPC or the synthetic covariance built
+        from these features is rank deficient.
+    device : str
+        Destination device.
+    overrides : dict, optional
+        Per-key replacements applied on top of the rung, for sweeping one
+        hyperparameter without adding a new rung.
+
+    Returns
+    -------
+    nn.Module
+        On ``device``, in eval mode, with every parameter's ``requires_grad``
+        set to False. Gradients still flow *through* it to reach the synthetic
+        data; they simply never accumulate on its own weights.
+
+    """
+
     seed = int(time.time() * 1000) % 100000
     torch.manual_seed(seed)
 
@@ -775,15 +846,19 @@ def sample_random_embedder(
     size = embedder_size.lower()
     overrides = overrides or {}
 
+    # SIZE_LADDERS, not EMBEDDER_REGISTRY, tells the abailavle names
     if name not in SIZE_LADDERS:
         raise ValueError(f"Unknown embedder_type={name}")
     if size not in SIZE_LADDERS[name]:
         raise ValueError(f"Unknown size={size} for {name}")
 
+    # Copy before mutating
     ladder = dict(SIZE_LADDERS[name][size])
     ladder.update(overrides)
 
     # ---- normalize kwargs ----
+    # Each architecture reads different keys off the rung, so the constructor
+    # arguments are assembled per family rather than passed through blindly
     if name == "ln_res_l":
         h = _round(hidden * ladder["hidden_mul"])
         kwargs = dict(
@@ -827,11 +902,13 @@ def sample_random_embedder(
     net = build_embedder(name, **kwargs)
 
     # ---- freeze + eval ----
+    # Freezing is what makes the embedder a fixed measuring stick: the loss
+    # gradient passes through it to syn_data but never updates it.
     for p in net.parameters():
         p.requires_grad_(False)
 
     net = net.to(device)
-    net.eval()
+    net.eval()          # disables dropout; matters for the size rungs that set it
     return net
 
 def sample_random_embedder_from_pool(
