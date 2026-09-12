@@ -300,12 +300,15 @@ class ObliviousTreeEnsemble(nn.Module):
         self.tree_dim = tree_dim
 
         # Feature selection logits: (T, D, input_dim)
+        # Initialized in 0, no random - Todo: consider better random initialization
+        # (hipothesis) in TAME embedder is not trained so 0 remains 0
         self.feature_logits = nn.Parameter(torch.zeros(num_trees, depth, input_dim))
 
         # Thresholds per tree+depth: (T, D)
+        # Initialized in 0, no random - Todo: consider better random initialization
+        # (hipothesis) in TAME embedder is not trained so 0 remains 0
         self.thresholds = nn.Parameter(torch.zeros(num_trees, depth))
 
-        # Temperature / sharpness per tree+depth: (T, D), constrained positive via softplus
         self.alpha_unconstrained = nn.Parameter(torch.full((num_trees, depth), math.log(math.exp(alpha_init) - 1.0)))
 
         # Leaf values: (T, 2^D, tree_dim)
