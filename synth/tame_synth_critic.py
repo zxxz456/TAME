@@ -106,6 +106,16 @@ def tame_critic_synthesize(data, config):
         critic = CriticMLP(input_dim, num_classes).to(device)
         opt_critic = torch.optim.Adam(critic.parameters(), lr=critic_lr, betas=(0.5, 0.9))
 
+    # Optional snapshot trail, mirroring tame_synth.py. This is instrumentation,
+    # not intervention: cloning consumes no randomness and touches neither the
+    # optimizer nor best_syn, so the distillation trajectory is unchanged.
+    # Recording the trail is what lets the critic arm take part in the
+    # validation-based selection of Sec. 4.2, which it could not before.
+    snapshot_every = int(config.get("snapshot_every", 0))
+    snapshots = []
+    if snapshot_every:
+        snapshots.append((-1, syn_data.detach().clone()))   # the init subset
+
     best_loss = float("inf")
     best_it = -1
     best_syn = syn_data.detach().clone()
@@ -156,15 +166,27 @@ def tame_critic_synthesize(data, config):
             if use_center:
                 loss_center = loss_center + 0.5 * ((feat_syn - prototypes[c]) ** 2).sum(1).mean()
 
-        loss_total = loss_mean + loss_cov
+        # Distribution-matching part only. This is the quantity the non-GAN arm
+        # selects on, so keeping it separate is what makes the two arms
+        # comparable.
+        loss_dm = loss_mean + loss_cov
         if use_center:
-            loss_total = loss_total + center_weight * loss_center
+            loss_dm = loss_dm + center_weight * loss_center
 
+        loss_total = loss_dm
         if critic_active:
             critic.eval()
             loss_total = loss_total + adv_weight * (-critic(syn_data, label_syn).mean())
 
-        cur = float((loss_total / num_classes).detach().item())
+        # Selection scalar. With clean_selection the adversarial term is excluded:
+        # a WGAN critic's output is unbounded and drifts in sign and scale as it
+        # trains (the gradient penalty bounds the norm of its gradient, not its
+        # value), so including it makes best_loss a non-stationary criterion and
+        # best_syn can freeze on an early iterate for reasons unrelated to the
+        # synthetic data. Default False reproduces the published behaviour.
+        clean_selection = bool(config.get("dm_critic_clean_selection", False))
+        sel_loss = loss_dm if clean_selection else loss_total
+        cur = float((sel_loss / num_classes).detach().item())
         if np.isfinite(cur) and cur < best_loss:
             best_loss = cur
             best_it = it
@@ -174,6 +196,9 @@ def tame_critic_synthesize(data, config):
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
             optimizer.step()
+
+        if snapshot_every and it % snapshot_every == 0:
+            snapshots.append((it, syn_data.detach().clone()))
 
         if it % 100 == 0:
             extras = []
@@ -193,4 +218,6 @@ def tame_critic_synthesize(data, config):
             os.path.join(save_dir, "best_syn.pt"),
         )
 
+    if config.get("return_snapshots", False):
+        return best_syn, label_syn.detach(), snapshots
     return best_syn, label_syn.detach()
