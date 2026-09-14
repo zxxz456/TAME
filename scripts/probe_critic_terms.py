@@ -9,7 +9,7 @@ from synth.tame_synth import cov_matrix
 from synth.tame_synth_critic import CriticMLP, _gradient_penalty
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-IPC, ITERS, ADV_W, N_CRITIC = 50, 1000, 0.05, 3
+IPC, ITERS, ADV_W, N_CRITIC = 50, 200, 0.05, 3
 random.seed(132); np.random.seed(132); torch.manual_seed(132)
 
 data = prepare_db({"random_seed": 132, "device": DEV}, name="adult")
@@ -52,21 +52,35 @@ for it in range(ITERS + 1):
     critic.eval()
     d_syn = critic(syn, lab).mean()
     adv = ADV_W * (-d_syn)
+
+    # Gradient norms of each term separately. The value ratio answers whether the
+    # adversarial term can move the argmin of the selection scalar; this answers
+    # the different and more important question of whether it moves the data at
+    # all. A small-valued term can still be steep.
+    g_dm = torch.autograd.grad(loss_dm, syn, retain_graph=True)[0].norm().item()
+    g_adv = torch.autograd.grad(adv, syn, retain_graph=True)[0].norm().item()
+
     (loss_dm + adv).backward()
     torch.nn.utils.clip_grad_norm_([syn], 10.0); opt.step()
 
     rows.append(dict(it=it, loss_dm=loss_dm.item(), adv=adv.item(),
                      d_syn=d_syn.item(),
-                     ratio=abs(adv.item()) / max(abs(loss_dm.item()), 1e-12)))
+                     ratio=abs(adv.item()) / max(abs(loss_dm.item()), 1e-12),
+                     g_dm=g_dm, g_adv=g_adv,
+                     g_ratio=g_adv / max(g_dm, 1e-12)))
     if it % 100 == 0:
         r = rows[-1]
         print(f"it {it:4d} | dm {r['loss_dm']:9.4f} | adv {r['adv']:9.4f} "
-              f"| D(syn) {r['d_syn']:9.4f} | |adv|/dm {r['ratio']:7.3f}", flush=True)
+              f"| D(syn) {r['d_syn']:8.4f} | |adv|/dm {r['ratio']:6.3f} "
+              f"| grad dm {r['g_dm']:8.4f} adv {r['g_adv']:8.4f} "
+              f"| ratio {r['g_ratio']:6.3f}", flush=True)
 
 df = pd.DataFrame(rows)
 out = os.path.expanduser("~/tame_runs/critic_terms.csv"); df.to_csv(out, index=False)
-print("\n=== magnitudes ===")
+print("\n=== magnitudes (valor) ===")
 print(df[["loss_dm", "adv", "d_syn", "ratio"]].describe().loc[["mean","50%","min","max"]].round(4))
+print("\n=== magnitudes (gradiente sobre syn_data) ===")
+print(df[["g_dm", "g_adv", "g_ratio"]].describe().loc[["mean","50%","min","max"]].round(4))
 print("\n=== deriva de D(syn) por tramo ===")
 print(df.groupby(df.it // 200).d_syn.agg(["mean","min","max"]).round(4))
 print("\nCSV ->", out)
