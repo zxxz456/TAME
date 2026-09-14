@@ -8,7 +8,8 @@ One random embedder per iteration, best-loss checkpoint, saves .pt output.
 import os
 import torch
 import numpy as np
-from models.embedders import sample_random_embedder
+from models.embedders import sample_random_embedder, reinit_embedder_
+from .instrument import IterTimer
 
 
 def cov_matrix(z, eps=0.0):
@@ -133,11 +134,25 @@ def tame_synthesize(data, config):
     y_np = y_train.cpu().numpy()
     indices_class = [np.where(y_np == c)[0] for c in range(num_classes)]
 
+    cls_n = [len(i) for i in indices_class]
+
+    def draw_rows(c, n):
+        """Row ids for n samples of class c. With replacement only when the
+        class is smaller than the request, which matters for imbalanced sets."""
+        return np.random.choice(indices_class[c], n, replace=cls_n[c] < n)
+
     def get_real_batch(c, n):
-        """Draw n rows of class c. Samples with replacement only when the class
-        is smaller than the request, which matters for imbalanced datasets."""
-        idx = indices_class[c]
-        return X_train[np.random.choice(idx, n, replace=len(idx) < n)]
+        return X_train[draw_rows(c, n)]
+
+    def get_real_all(n):
+        """One batch of n rows for EVERY class, as (num_classes, n, input_dim).
+
+        The draws are the same ones get_real_batch would make, class by class
+        and in the same order, so the sampling is unchanged. What changes is
+        that they reach the GPU as a single gather instead of one per class,
+        which is what the per-class loop used to cost."""
+        idx = np.concatenate([draw_rows(c, n) for c in range(num_classes)])
+        return X_train[torch.as_tensor(idx, device=device)].view(num_classes, n, input_dim)
 
     # THE synthetic set: this is the optimisation variable
     # requires_grad=True makes the rows behave like model weights
@@ -172,6 +187,16 @@ def tame_synthesize(data, config):
     # this reduces gradient varianse without rescaling the effective lr
     views = int(config.get("dm_views", 1))
 
+    # ONE embedder, redrawn in place every view. Constructing a module and
+    # allocating its parameters is Python-side work that dominated the wall
+    # clock for tensors this small; reinit_embedder_ gives a draw from the same
+    # distribution without paying for it iters * views times.
+    embed_net = sample_random_embedder(
+        embedder_type, embedder_size, input_dim, embed_hidden, embed_dim, device,
+        overrides=config.get("dm_embedder_overrides"),
+    )
+    embed_net.eval()
+
     # Optional trail of intermediate states, used by the validation-based
     # snapshot selection
     snapshot_every = int(config.get("snapshot_every", 0))
@@ -181,12 +206,27 @@ def tame_synthesize(data, config):
 
     # Running best. Note this tracks the LOWEST LOSS, not the last state; the
     # final iterate is discarded unless it happens to be the best
-    best_loss = float("inf")
-    best_it = -1
+    # All three live on the device. Comparing a loss on the host would mean a
+    # .item() every iteration, and each of those blocks until the GPU has
+    # drained its queue; torch.where keeps the decision on the device, so the
+    # queue never empties. They are read once, after the loop.
+    best_loss = torch.full((), float("inf"), device=device)
+    best_it = torch.full((), -1.0, device=device)
     best_syn = syn_data.detach().clone()
+
+    # Per-iteration trace, also accumulated on device: (loss, mean part, cov
+    # part, grad norm) per row, plus the two terms broken down by class. Both
+    # are cheap, (iters+1) x 4 and (iters+1) x C x 2 floats.
+    trace_t = torch.zeros((iters + 1, 4), device=device)
+
+    # Cronometro por iteracion; ver synth/instrument.py. No sincroniza dentro
+    # del bucle, que es justo lo que esta optimizacion se propuso evitar.
+    timer = IterTimer(iters, device)
+    per_class = torch.zeros((iters + 1, num_classes, 2), device=device)
 
     # --- MAIN LOOP ---
     for it in range(iters + 1):
+        timer.tick(it)
         optimizer.zero_grad(set_to_none=True)   # clear last step's gradients
 
         # Accumulated separately (each term stays inspectable), but they are
@@ -195,88 +235,126 @@ def tame_synthesize(data, config):
         loss_cov = torch.zeros((), device=device)
 
         # --- VIEWS (embedders) LOOP ---
-        # Create $views$ embedderss over the same iteration and comp the loss
+        # $views$ embedders over the same iteration, losses averaged
         for _ in range(views):
-            # A brand-new random network (embedder) every iteration, built frozen and in
-            # eval mode. It is never trained and never reused. Matching moments
+            # A fresh random draw of every weight, in place. The network is
+            # never trained and never reused across views: matching moments
             # under many arbitrary projections is what stops syn_data from
-            # overfitting to one particular embedding geometry
-            embed_net = sample_random_embedder(
-                embedder_type, embedder_size, input_dim, embed_hidden, embed_dim, device
-            )
-            embed_net.eval()
+            # overfitting to one particular embedding geometry.
+            reinit_embedder_(embed_net)
 
-            # --- MEASURES LOOP ----
-            for c in range(num_classes):
-                # Take a real batch
-                real_b = get_real_batch(c, batch_real)
-                # Take synthetic batch
-                syn_b = syn_data[c * ipc:(c + 1) * ipc]
+            # --- MEASURES, ALL CLASSES AT ONCE ---
+            # The classes used to be looped one by one, which meant num_classes
+            # separate forwards, gathers and reductions per view. They are
+            # independent, so they stack into a leading dimension and go through
+            # the embedder as a single batch. Same arithmetic, one launch.
+            real_b = get_real_all(batch_real)             # (C, B, d)
+            syn_b = syn_data.view(num_classes, ipc, input_dim)
 
-                # Both sides go through the SAME embedder in the SAME iteration;
-                # (comparing moments under different projections would be
-                # dumb/meaningless)
-                feat_real = embed_net(real_b).detach() # freeze real side into 
-                                                       # a constant target in such
-                                                       # way only the synthetic 
-                                                       # path carries gradient
-                feat_syn = embed_net(syn_b)
+            # Both sides go through the SAME embedder in the SAME iteration;
+            # comparing moments under different projections would be meaningless
+            feat_real = embed_net(                        # (C, B, p)
+                real_b.reshape(-1, input_dim)
+            ).detach().view(num_classes, batch_real, embed_dim)
+            feat_syn = embed_net(                         # (C, ipc, p)
+                syn_b.reshape(-1, input_dim)
+            ).view(num_classes, ipc, embed_dim)
 
-                mu_r, cov_r = cov_matrix(feat_real, eps)
-                mu_s, cov_s = cov_matrix(feat_syn, eps)
+            # cov_matrix, batched over the class dimension. The real side is
+            # detached above, so only the synthetic path carries gradient.
+            mu_r = feat_real.mean(1)                      # (C, p)
+            mu_s = feat_syn.mean(1)
+            zr = feat_real - mu_r.unsqueeze(1)            # centred
+            zs = feat_syn - mu_s.unsqueeze(1)
+            cov_r = zr.transpose(1, 2) @ zr / max(batch_real, 1)   # (C, p, p)
+            cov_s = zs.transpose(1, 2) @ zs / max(ipc, 1)
+            if eps > 0:
+                ridge = eps * torch.eye(embed_dim, device=device)
+                cov_r = cov_r + ridge
+                cov_s = cov_s + ridge
 
-                # Eq. 7. 
-                # First term aligns position (squared L2 between
-                # centroids)
-                # Second aligns shape (squared Frobenius between
-                # covariances, i.e. the sum over every matrix entry, so
-                # off-diagonal correlations count too)
-                #                       ‖μᵀ_c − μˢ_c‖²₂
-                loss_mean = loss_mean + ((mu_r - mu_s) ** 2).sum()
-                diff = cov_r - cov_s
-                loss_cov = loss_cov + cov_weight * (diff * diff).sum()
-                #                         λ         ‖Σᵀ_c − Σˢ_c‖²_F
+            # Eq. 7, per class and then summed.
+            # First term aligns position (squared L2 between centroids)
+            # Second aligns shape (squared Frobenius between covariances, i.e.
+            # the sum over every matrix entry, so off-diagonal correlations
+            # count too)
+            #                     ‖μᵀ_c − μˢ_c‖²₂
+            term_mean = ((mu_r - mu_s) ** 2).sum(-1)              # (C,)
+            diff = cov_r - cov_s
+            term_cov = cov_weight * (diff * diff).sum((-1, -2))   # (C,)
+            #                         λ         ‖Σᵀ_c − Σˢ_c‖²_F
+            loss_mean = loss_mean + term_mean.sum()
+            loss_cov = loss_cov + term_cov.sum()
+
+            # Which classes are hard, and whether it is position or shape that
+            # is failing. Averaged over views at the end.
+            with torch.no_grad():
+                per_class[it, :, 0] += term_mean
+                per_class[it, :, 1] += term_cov
 
         # This thing is a scalar tensor (a tensor with shape (), no dimensions)
         # basically a number but covered as a tensor, it is conected to the
         # computation graph and can propagate gradients
         loss_total = (loss_mean + loss_cov) / views
 
-        # Per-class loss (for logging and checkpoint selection) 
+        # Per-class loss, kept on the device.
         # IMPORTANT NOTE:
-        # Values from different iterations are measured under different embedders and
-        # are therefore not strictly comparable, which makes this a noisy
+        # Values from different iterations are measured under different embedders
+        # and are therefore not strictly comparable, which makes this a noisy
         # criterion; it is why the printed loss does not decrease monotonically
-        cur = float((loss_total / num_classes).detach().item())
-        if np.isfinite(cur) and cur < best_loss:
-            best_loss = cur
-            best_it = it
-            best_syn = syn_data.detach().clone()   # clone: syn_data keeps moving
+        cur = (loss_total / num_classes).detach()
 
-        # A non-finite loss skips the step instead of raising. Keeps a diverging
-        # run alive, but it will produce nothing while looking healthy
-        if torch.isfinite(loss_total):
-            # backward() walks back THROUGH the frozen embedder to reach syn_data
-            loss_total.backward() # comp ∂loss/∂syn_data and save in syn_data.grad
-            torch.nn.utils.clip_grad_norm_([syn_data], grad_clip) # scale if
-                                                                  # too big
-            optimizer.step()        # the rows move here (syn_data -= lr * grad)
+        # Running best, decided on the device. torch.where selects without a
+        # host-side branch, so nothing here forces the GPU queue to drain.
+        improved = torch.isfinite(cur) & (cur < best_loss)
+        best_loss = torch.where(improved, cur, best_loss)
+        best_it = torch.where(improved, torch.as_tensor(float(it), device=device), best_it)
+        best_syn = torch.where(improved, syn_data.detach(), best_syn)
+
+        # backward() walks back THROUGH the frozen embedder to reach syn_data.
+        # A non-finite loss used to skip the step; zeroing the gradient instead
+        # keeps that decision on the device. On a healthy run nan_to_num_ is a
+        # no-op, and a diverging one produces nothing either way.
+        loss_total.backward()   # comp ∂loss/∂syn_data and save in syn_data.grad
+        torch.nan_to_num_(syn_data.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        # clip_grad_norm_ returns the norm it measured BEFORE clipping, which is
+        # the honest size of the step the distillation wanted to take.
+        grad_norm = torch.nn.utils.clip_grad_norm_([syn_data], grad_clip)
+        optimizer.step()        # the rows move here (syn_data -= lr * grad)
+
+        trace_t[it, 0] = cur
+        trace_t[it, 1] = loss_mean.detach() / (views * num_classes)
+        trace_t[it, 2] = loss_cov.detach() / (views * num_classes)
+        trace_t[it, 3] = grad_norm
 
         if snapshot_every and it % snapshot_every == 0:
             snapshots.append((it, syn_data.detach().clone()))
 
+        # The only sync in the loop, and it happens 11 times out of 1001.
         if it % 100 == 0:
             print(
                 f"[TAME] iter {it:04d} | "
-                f"loss {cur:.6f} | best {best_loss:.6f}@{best_it:04d}"
+                f"loss {cur.item():.6f} | best {best_loss.item():.6f}@{int(best_it.item()):04d}"
             )
+
+    # Off the device once, after the loop.
+    dt_ms = timer.result()["dt_ms"]
+    best_loss = float(best_loss.item())
+    best_it = int(best_it.item())
+    trace = [(i, *row, ms) for (i, row), ms
+             in zip(enumerate(trace_t.cpu().tolist()), dt_ms)]
 
     # Optional side channel; main.py does its own saving and leaves this unset.
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         torch.save(
             {"X_syn": best_syn.cpu(), "y_syn": label_syn.cpu(),
-             "best_loss": best_loss, "best_it": best_it},
+             "best_loss": best_loss, "best_it": best_it,
+             # (it, loss, loss_mean, loss_cov, grad_norm, dt_ms) per iteration
+             "trace": trace,
+             # (iters+1, num_classes, 2): the two terms, per class, per iteration
+             "per_class": (per_class / views).cpu(),
+             "snapshots": [(i, x.cpu()) for i, x in snapshots]},
             os.path.join(save_dir, "best_syn.pt"),
         )
 
