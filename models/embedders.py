@@ -292,12 +292,21 @@ class ObliviousTreeEnsemble(nn.Module):
         depth: int,
         tree_dim: int,
         alpha_init: float = 5.0,
+        random_init: bool = False, # Degenerated NODE flag
+        logit_std: float = 3.0,    # dev of norm dist for filling the tensor
+        thr_std: float = 1.0,      # threshold dev
     ):
         super().__init__()
         self.input_dim = input_dim
         self.num_trees = num_trees
         self.depth = depth
         self.tree_dim = tree_dim
+        # Kept so reinit_embedder_ can redraw this module in place without
+        # rebuilding it; nn.Parameter tensors have no reset_parameters().
+        self._alpha_init = alpha_init
+        self._random_init = random_init
+        self._logit_std = logit_std
+        self._thr_std = thr_std
 
         # Feature selection logits: (T, D, input_dim)
         # Initialized in 0, no random - Todo: consider better random initialization
@@ -316,6 +325,19 @@ class ObliviousTreeEnsemble(nn.Module):
 
         # Small init helps stability
         nn.init.normal_(self.leaf_values, mean=0.0, std=0.02)
+
+        # TAME never trains the embedder, so zeroed tree parameters stay zeroed
+        # and the ensemble degenerates: softmax(zeros) is uniform, so every tree
+        # and every level reads the same mean of all coordinates, and the whole
+        # ensemble collapses to a one-dimensional curve. random_init gives each
+        # tree and level its own feature and threshold, which is what makes this
+        # an ensemble of axis-aligned partitions rather than a near-linear map.
+        # Default False keeps the published behaviour.
+        if random_init:
+            nn.init.normal_(self.feature_logits, mean=0.0, std=logit_std)
+            # The ensemble sees LayerNorm'd activations, so unit-scale thresholds
+            # land inside the range the data actually occupies.
+            nn.init.normal_(self.thresholds, mean=0.0, std=thr_std)
 
     def forward(self, x):
         """
@@ -371,6 +393,7 @@ class EmbedderNODE(nn.Module):
         depth: int = 6,
         tree_dim: int = None,
         dropout: float = 0.0,
+        tree_random_init: bool = False,
     ):
         super().__init__()
         if tree_dim is None:
@@ -383,6 +406,7 @@ class EmbedderNODE(nn.Module):
                 num_trees=num_trees,
                 depth=depth,
                 tree_dim=tree_dim,
+                random_init=tree_random_init,
             )
             for _ in range(num_layers)
         ])
@@ -787,6 +811,45 @@ def build_embedder(name: str, **kwargs):
         )
     return EMBEDDER_REGISTRY[name](**kwargs)
 
+@torch.no_grad()
+def reinit_embedder_(net):
+    """Redraw every weight of an existing embedder, in place
+
+    TAME uses each embedder for a single iteration, so a full run builds
+    ``dm_iters * dm_views`` networks. Constructing an ``nn.Module``, allocating
+    its parameters and moving them to the device is Python-side work repeated
+    thousands of times, and it dominates the wall clock for the small tensors
+    this method uses. Reinitialising one module instead gives a draw from the
+    same distribution at a fraction of the cost
+
+    Every submodule that defines ``reset_parameters`` is asked to redraw itself,
+    which is exactly what PyTorch does at construction. ``ObliviousTreeEnsemble``
+    holds raw ``nn.Parameter`` tensors with no such hook, so its initialisation
+    is repeated explicitly, including the ``random_init`` branch
+
+    Parameters
+    ----------
+    net : nn.Module
+        An embedder previously built by ``sample_random_embedder``. Its
+        ``requires_grad=False`` flags and eval mode are left untouched
+    """
+    for m in net.modules():
+        if isinstance(m, ObliviousTreeEnsemble):
+            # Same sequence as __init__, so the recycled draw is distributed
+            # identically to a freshly constructed one.
+            m.feature_logits.zero_()
+            m.thresholds.zero_()
+            m.alpha_unconstrained.fill_(math.log(math.exp(m._alpha_init) - 1.0))
+            nn.init.normal_(m.leaf_values, mean=0.0, std=0.02)
+            if m._random_init:
+                nn.init.normal_(m.feature_logits, mean=0.0, std=m._logit_std)
+                nn.init.normal_(m.thresholds, mean=0.0, std=m._thr_std)
+            continue
+        reset = getattr(m, "reset_parameters", None)
+        if callable(reset):
+            reset()
+
+
 def sample_random_embedder(
     embedder_type: str,
     embedder_size: str,
@@ -892,6 +955,9 @@ def sample_random_embedder(
             depth=ladder["depth"],
             tree_dim=tree_dim,
             dropout=0.0,
+            # Off by default; pass overrides={"tree_random_init": True} to get a
+            # genuine random ensemble instead of the degenerate zero init.
+            tree_random_init=bool(ladder.get("tree_random_init", False)),
         )
 
     else:
