@@ -298,6 +298,9 @@ class ObliviousTreeEnsemble(nn.Module):
         self.num_trees = num_trees
         self.depth = depth
         self.tree_dim = tree_dim
+        # Kept so reinit_embedder_ can redraw this module in place without
+        # rebuilding it; nn.Parameter tensors have no reset_parameters().
+        self._alpha_init = alpha_init
 
         # Feature selection logits: (T, D, input_dim)
         self.feature_logits = nn.Parameter(torch.zeros(num_trees, depth, input_dim))
@@ -757,6 +760,42 @@ def build_embedder(name: str, **kwargs):
             f"Available embedders: {list(EMBEDDER_REGISTRY.keys())}"
         )
     return EMBEDDER_REGISTRY[name](**kwargs)
+
+@torch.no_grad()
+def reinit_embedder_(net):
+    """Redraw every weight of an existing embedder, in place
+
+    TAME uses each embedder for a single iteration, so a full run builds
+    ``dm_iters * dm_views`` networks. Constructing an ``nn.Module``, allocating
+    its parameters and moving them to the device is Python-side work repeated
+    thousands of times, and it dominates the wall clock for the small tensors
+    this method uses. Reinitialising one module instead gives a draw from the
+    same distribution at a fraction of the cost
+
+    Every submodule that defines ``reset_parameters`` is asked to redraw itself,
+    which is exactly what PyTorch does at construction. ``ObliviousTreeEnsemble``
+    holds raw ``nn.Parameter`` tensors with no such hook, so its initialisation
+    is repeated explicitly
+
+    Parameters
+    ----------
+    net : nn.Module
+        An embedder previously built by ``sample_random_embedder``. Its
+        ``requires_grad=False`` flags and eval mode are left untouched
+    """
+    for m in net.modules():
+        if isinstance(m, ObliviousTreeEnsemble):
+            # Same sequence as __init__, so the recycled draw is distributed
+            # identically to a freshly constructed one.
+            m.feature_logits.zero_()
+            m.thresholds.zero_()
+            m.alpha_unconstrained.fill_(math.log(math.exp(m._alpha_init) - 1.0))
+            nn.init.normal_(m.leaf_values, mean=0.0, std=0.02)
+            continue
+        reset = getattr(m, "reset_parameters", None)
+        if callable(reset):
+            reset()
+
 
 def sample_random_embedder(
     embedder_type: str,
