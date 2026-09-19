@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from models.embedders import sample_random_embedder, reinit_embedder_
 from .instrument import IterTimer
+from .onehot import OneHotProjector
 
 
 def cov_matrix(z, eps=0.0):
@@ -128,6 +129,48 @@ def tame_synthesize(data, config):
 
     save_dir = config.get("save_dir", None)
 
+    # --- one-hot inside the loop. Off by default; see synth/onehot.py ---
+    # The dummies are two-valued z-scores after StandardScaler and the loop
+    # moves them as free reals, which is what run_snap_projection.py showed
+    # costs the tree classifiers. These modes keep them legal DURING the run:
+    #   "none"     the published behaviour
+    #   "ste"      the embedder sees hard one-hot rows; the gradient passes
+    #              straight through to the continuous variable
+    #   "soft"     softmax per group with a temperature annealed tau0 -> tau1
+    #   "project"  hard projection after every SGD step (projected gradient)
+    #   "penalty"  an L1 distance to the nearest legal value added to the loss,
+    #              weight gamma. Soft at the default, converges to a hard
+    #              projection as gamma grows
+    onehot_mode = str(config.get("dm_onehot_mode", "none")).lower()
+    if onehot_mode not in ("none", "ste", "soft", "project", "penalty"):
+        raise ValueError(
+            f"dm_onehot_mode={onehot_mode!r}; expected none, ste, soft, project or penalty")
+    proj = OneHotProjector(X_train) if onehot_mode != "none" else None
+    if proj is not None and not proj:
+        # No one-hot groups in this dataset: nothing to project, so the mode
+        # degrades to the published loop instead of pretending.
+        onehot_mode, proj = "none", None
+    tau0 = float(config.get("dm_onehot_tau0", 1.0))
+    tau1 = float(config.get("dm_onehot_tau1", 0.05))
+    # 100 is where the L1 term is measurable next to the moment gradient on
+    # adult without yet clamping everything; 300 clamps 100% of the entries.
+    onehot_gamma = float(config.get("dm_onehot_gamma", 100.0))
+
+    def vista(x, it):
+        """The rows the embedder sees this iteration."""
+        if onehot_mode == "ste":
+            return proj.ste(x)
+        if onehot_mode == "soft":
+            tau = tau0 * (tau1 / tau0) ** (it / max(iters, 1))
+            return proj.soft(x, tau)
+        return x
+
+    def salida(x):
+        """The rows that leave the loop: legal for the discrete modes, raw otherwise."""
+        if onehot_mode in ("ste", "soft", "project"):
+            return proj.hard(x)
+        return x
+
     # Precompute row indices per class once. The optimisation is class-wise, so
     # every iteration needs to draw from a single class at a time; doing the
     # lookup here keeps it out of the hot loop
@@ -202,7 +245,7 @@ def tame_synthesize(data, config):
     snapshot_every = int(config.get("snapshot_every", 0))
     snapshots = []
     if snapshot_every:
-        snapshots.append((-1, syn_data.detach().clone()))
+        snapshots.append((-1, salida(syn_data.detach()).clone()))
 
     # Running best. Note this tracks the LOWEST LOSS, not the last state; the
     # final iterate is discarded unless it happens to be the best
@@ -212,15 +255,15 @@ def tame_synthesize(data, config):
     # queue never empties. They are read once, after the loop.
     best_loss = torch.full((), float("inf"), device=device)
     best_it = torch.full((), -1.0, device=device)
-    best_syn = syn_data.detach().clone()
+    best_syn = salida(syn_data.detach()).clone()
 
     # Per-iteration trace, also accumulated on device: (loss, mean part, cov
     # part, grad norm) per row, plus the two terms broken down by class. Both
     # are cheap, (iters+1) x 4 and (iters+1) x C x 2 floats.
     trace_t = torch.zeros((iters + 1, 4), device=device)
 
-    # Cronometro por iteracion; ver synth/instrument.py. No sincroniza dentro
-    # del bucle, que es justo lo que esta optimizacion se propuso evitar.
+    # Per-iteration timer; see synth/instrument.py. It does not synchronise
+    # inside the loop, which is exactly what this optimisation set out to avoid.
     timer = IterTimer(iters, device)
     per_class = torch.zeros((iters + 1, num_classes, 2), device=device)
 
@@ -249,7 +292,7 @@ def tame_synthesize(data, config):
             # independent, so they stack into a leading dimension and go through
             # the embedder as a single batch. Same arithmetic, one launch.
             real_b = get_real_all(batch_real)             # (C, B, d)
-            syn_b = syn_data.view(num_classes, ipc, input_dim)
+            syn_b = vista(syn_data, it).view(num_classes, ipc, input_dim)
 
             # Both sides go through the SAME embedder in the SAME iteration;
             # comparing moments under different projections would be meaningless
@@ -296,6 +339,11 @@ def tame_synthesize(data, config):
         # basically a number but covered as a tensor, it is conected to the
         # computation graph and can propagate gradients
         loss_total = (loss_mean + loss_cov) / views
+        if onehot_mode == "penalty":
+            # Stationary and deterministic in syn_data, so unlike the critic
+            # term it is safe to let it take part in the best-loss selection.
+            pozo, suma = proj.penalty(syn_data)
+            loss_total = loss_total + onehot_gamma * (pozo + suma)
 
         # Per-class loss, kept on the device.
         # IMPORTANT NOTE:
@@ -309,7 +357,7 @@ def tame_synthesize(data, config):
         improved = torch.isfinite(cur) & (cur < best_loss)
         best_loss = torch.where(improved, cur, best_loss)
         best_it = torch.where(improved, torch.as_tensor(float(it), device=device), best_it)
-        best_syn = torch.where(improved, syn_data.detach(), best_syn)
+        best_syn = torch.where(improved, salida(syn_data.detach()), best_syn)
 
         # backward() walks back THROUGH the frozen embedder to reach syn_data.
         # A non-finite loss used to skip the step; zeroing the gradient instead
@@ -321,6 +369,9 @@ def tame_synthesize(data, config):
         # the honest size of the step the distillation wanted to take.
         grad_norm = torch.nn.utils.clip_grad_norm_([syn_data], grad_clip)
         optimizer.step()        # the rows move here (syn_data -= lr * grad)
+        if onehot_mode == "project":
+            with torch.no_grad():
+                syn_data.copy_(proj.hard(syn_data))
 
         trace_t[it, 0] = cur
         trace_t[it, 1] = loss_mean.detach() / (views * num_classes)
@@ -328,7 +379,7 @@ def tame_synthesize(data, config):
         trace_t[it, 3] = grad_norm
 
         if snapshot_every and it % snapshot_every == 0:
-            snapshots.append((it, syn_data.detach().clone()))
+            snapshots.append((it, salida(syn_data.detach()).clone()))
 
         # The only sync in the loop, and it happens 11 times out of 1001.
         if it % 100 == 0:
@@ -350,6 +401,8 @@ def tame_synthesize(data, config):
         torch.save(
             {"X_syn": best_syn.cpu(), "y_syn": label_syn.cpu(),
              "best_loss": best_loss, "best_it": best_it,
+             "onehot_mode": onehot_mode,
+             "onehot_drift": proj.drift(best_syn) if proj is not None else None,
              # (it, loss, loss_mean, loss_cov, grad_norm, dt_ms) per iteration
              "trace": trace,
              # (iters+1, num_classes, 2): the two terms, per class, per iteration
