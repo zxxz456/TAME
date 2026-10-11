@@ -152,8 +152,12 @@ def tame_synthesize(data, config):
         onehot_mode, proj = "none", None
     tau0 = float(config.get("dm_onehot_tau0", 1.0))
     tau1 = float(config.get("dm_onehot_tau1", 0.05))
-    # 100 is where the L1 term is measurable next to the moment gradient on
-    # adult without yet clamping everything; 300 clamps 100% of the entries.
+    # No value of gamma makes the trajectory legal. On adult, ipc 10, 1000
+    # iterations, the last iterate's drift falls from 0.062 at gamma 0 to a
+    # floor near 0.01 by gamma 100 and stays there, with 0% of entries exact at
+    # every weight: an L1 subgradient with a fixed step and momentum oscillates
+    # around its target instead of settling on it. 100 is the default because it
+    # is roughly where that floor is reached.
     onehot_gamma = float(config.get("dm_onehot_gamma", 100.0))
 
     def vista(x, it):
@@ -338,19 +342,27 @@ def tame_synthesize(data, config):
         # This thing is a scalar tensor (a tensor with shape (), no dimensions)
         # basically a number but covered as a tensor, it is conected to the
         # computation graph and can propagate gradients
-        loss_total = (loss_mean + loss_cov) / views
+        # Eq. 7 alone. This is what decides which iterate is returned, whatever
+        # else is added to the loss that gets differentiated.
+        loss_dm = (loss_mean + loss_cov) / views
+        loss_total = loss_dm
         if onehot_mode == "penalty":
-            # Stationary and deterministic in syn_data, so unlike the critic
-            # term it is safe to let it take part in the best-loss selection.
+            # The penalty steers the optimisation but does not choose the
+            # iterate. It is exactly zero on real rows, so when it took part in
+            # the selection the initialisation won at large gamma and best_syn
+            # came back as the real rows the run started from (gamma 300 on
+            # adult, every seed tried). Same principle as the critic's clean
+            # selection, but without a flag: this mode is not in the paper, so
+            # there is no published behaviour to reproduce.
             pozo, suma = proj.penalty(syn_data)
-            loss_total = loss_total + onehot_gamma * (pozo + suma)
+            loss_total = loss_dm + onehot_gamma * (pozo + suma)
 
         # Per-class loss, kept on the device.
         # IMPORTANT NOTE:
         # Values from different iterations are measured under different embedders
         # and are therefore not strictly comparable, which makes this a noisy
         # criterion; it is why the printed loss does not decrease monotonically
-        cur = (loss_total / num_classes).detach()
+        cur = (loss_dm / num_classes).detach()
 
         # Running best, decided on the device. torch.where selects without a
         # host-side branch, so nothing here forces the GPU queue to drain.

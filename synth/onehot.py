@@ -223,8 +223,12 @@ class OneHotProjector:
         produces exact zeros and L2 does not: the double well's gradient
         vanishes as it approaches 0 and 1, so it gets close and never arrives,
         and on `adult` at 300 iterations it never passed 13% of legal entries at
-        any weight. The L1 distance pulls with constant force until the value is
-        pinned: at ``gamma=300`` it leaves 100% exact. The target being aimed at
+        any weight. The L1 distance pulls with constant force instead, so it gets
+        much closer, but with a fixed step and momentum it oscillates around the
+        target rather than landing on it: on `adult` at 1000 iterations the last
+        iterate keeps a drift near 0.01 and 0% of its entries exact at every
+        weight up to 300. An earlier reading of "100% exact" was the best-loss
+        selection returning the initialisation, not the penalty. The target being aimed at
         is ``detach``ed, so the gradient is the distance's and does not move the
         target
 
@@ -233,9 +237,10 @@ class OneHotProjector:
         one would be inventing data. In this form the penalty is exactly zero on
         real rows, which is the same condition ``hard`` satisfies
 
-        It projects nothing: it is a soft constraint added to Eq. 7. With a high
-        ``gamma`` it converges to the hard projection; with a moderate one it
-        stops halfway, and that is where its interest as a baseline lies
+        It projects nothing: it is a soft constraint added to Eq. 7, and it never
+        becomes a hard one. Raising ``gamma`` shrinks the distance to a floor and
+        no further, so this mode is a family of soft constraints, not a path to
+        the hard projection
         """
         if not self.n_groups:
             return X.new_zeros(()), X.new_zeros(())
