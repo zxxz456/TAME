@@ -17,8 +17,10 @@ for a in "$@"; do
 done
 mkdir -p "$OUT"
 # Each worker gets a share of the 16 cores; without this RF and XGBoost each ask
-# for all of them and fight.
-THREADS=$(( $(nproc) / W )); [ "$THREADS" -lt 1 ] && THREADS=1
+# for all of them and fight. When two sweeps share the machine, pass THREADS in
+# the environment so the total across both matches the cores, since each sweep
+# only knows about its own workers.
+THREADS=${THREADS:-$(( $(nproc) / W ))}; [ "$THREADS" -lt 1 ] && THREADS=1
 echo "script=$SCRIPT  workers=$W  threads/worker=$THREADS  datasets=${#DS[@]}  extra=${EXTRA[*]:-}"
 printf '%s\n' "${DS[@]}" | xargs -P "$W" -I{} sh -c "
   export OMP_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS
@@ -41,3 +43,9 @@ df = pd.concat([pd.read_csv(f) for f in fs], ignore_index=True)
 df.to_csv(f"{out}/results.csv", index=False)
 print(f"\nmerged {len(fs)} shards -> {out}/results.csv  ({len(df)} rows)")
 PY
+# An optional step that needs every shard at once, such as a correlation across
+# datasets, which no single shard can compute. It gets the merged CSV.
+if [ -n "${POST:-}" ] && [ -f "$OUT/results.csv" ]; then
+  echo "--- post: $POST ---"
+  PYTHONPATH=/home/zxxz6/TAME /home/zxxz6/TAME/.venv/bin/python /home/zxxz6/TAME/scripts/$POST "$OUT/results.csv"
+fi
