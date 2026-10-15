@@ -181,6 +181,37 @@ def tame_synthesize(data, config):
     y_np = y_train.cpu().numpy()
     indices_class = [np.where(y_np == c)[0] for c in range(num_classes)]
 
+    # --- marginal term: 1-D Wasserstein per column, in data space. Off by default ---
+    # Eq. 7 compares moments of random mixtures of all the columns, and nothing
+    # in it constrains a single column. A tree splits one column at a time, on
+    # the order of its values, so that is the statistic this term matches: per
+    # class and per column, the W1 distance between the synthetic values and
+    # the real ones.
+    # In 1-D, W1 has a closed form: the L1 distance between quantile functions.
+    # With ipc synthetic points the synthetic quantile function is the sorted
+    # column, so the term is |sort(syn) - real quantiles at the ipc bin
+    # midpoints|, averaged over the points and summed over columns and classes.
+    # Summed over columns, not averaged, so that the push each entry receives
+    # does not shrink on wide datasets. The real quantiles come from the whole
+    # training class, once: the target is fixed, unlike the moment term's.
+    # Only the columns outside the one-hot groups: those belong to the one-hot
+    # modes above, and the two must not act on the same columns.
+    w1_weight = float(config.get("dm_w1_weight", 0.0))
+    w1_cols = w1_target = None
+    if w1_weight > 0:
+        en_grupo = torch.zeros(input_dim, dtype=torch.bool, device=device)
+        for g, _, _ in OneHotProjector(X_train).groups:
+            en_grupo[g] = True
+        w1_cols = torch.nonzero(~en_grupo).squeeze(1)
+        if w1_cols.numel() == 0:
+            w1_weight = 0.0                   # purely categorical: nothing to match
+        else:
+            q = (np.arange(ipc) + 0.5) / ipc
+            Xc = X_train[:, w1_cols].cpu().numpy()
+            w1_target = torch.as_tensor(       # (C, ipc, k)
+                np.stack([np.quantile(Xc[i], q, axis=0) for i in indices_class]),
+                dtype=torch.float32, device=device)
+
     cls_n = [len(i) for i in indices_class]
 
     def draw_rows(c, n):
@@ -265,6 +296,9 @@ def tame_synthesize(data, config):
     # part, grad norm) per row, plus the two terms broken down by class. Both
     # are cheap, (iters+1) x 4 and (iters+1) x C x 2 floats.
     trace_t = torch.zeros((iters + 1, 4), device=device)
+    # The marginal term per class, when it is on. Kept apart from trace_t so the
+    # layout of that one does not depend on the config.
+    trace_w1 = torch.zeros(iters + 1, device=device)
 
     # Per-iteration timer; see synth/instrument.py. It does not synchronise
     # inside the loop, which is exactly what this optimisation set out to avoid.
@@ -356,6 +390,16 @@ def tame_synthesize(data, config):
             # there is no published behaviour to reproduce.
             pozo, suma = proj.penalty(syn_data)
             loss_total = loss_dm + onehot_gamma * (pozo + suma)
+        if w1_weight > 0:
+            # Out of the selection for the same reason as the penalty: the
+            # initialisation is real rows and already sits close to the real
+            # quantiles, so letting this term vote would favour the start.
+            # sort is differentiable: the gradient goes back to the row each
+            # sorted value came from.
+            s = syn_data.view(num_classes, ipc, input_dim)[:, :, w1_cols]
+            loss_w1 = (s.sort(dim=1).values - w1_target).abs().mean(1).sum()
+            loss_total = loss_total + w1_weight * loss_w1
+            trace_w1[it] = loss_w1.detach() / num_classes
 
         # Per-class loss, kept on the device.
         # IMPORTANT NOTE:
@@ -398,6 +442,7 @@ def tame_synthesize(data, config):
             print(
                 f"[TAME] iter {it:04d} | "
                 f"loss {cur.item():.6f} | best {best_loss.item():.6f}@{int(best_it.item()):04d}"
+                + (f" | w1 {trace_w1[it].item():.4f}" if w1_weight > 0 else "")
             )
 
     # Off the device once, after the loop.
@@ -419,6 +464,9 @@ def tame_synthesize(data, config):
              "trace": trace,
              # (iters+1, num_classes, 2): the two terms, per class, per iteration
              "per_class": (per_class / views).cpu(),
+             "w1_weight": w1_weight,
+             # the marginal term per class, per iteration; zeros when it is off
+             "trace_w1": trace_w1.cpu(),
              "snapshots": [(i, x.cpu()) for i, x in snapshots]},
             os.path.join(save_dir, "best_syn.pt"),
         )
