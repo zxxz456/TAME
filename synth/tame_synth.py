@@ -11,6 +11,7 @@ import numpy as np
 from models.embedders import sample_random_embedder, reinit_embedder_
 from .instrument import IterTimer
 from .onehot import OneHotProjector
+from .snap import GridSnapper
 
 
 def cov_matrix(z, eps=0.0):
@@ -160,19 +161,37 @@ def tame_synthesize(data, config):
     # is roughly where that floor is reached.
     onehot_gamma = float(config.get("dm_onehot_gamma", 100.0))
 
+    # --- snap to observed values inside the loop. Off by default; see synth/snap.py ---
+    # One SGD step makes every value distinct, and in columns that take few values
+    # a tree can then split real ties on noise. With this on, the embedder sees
+    # every value replaced by the nearest one its column takes in the training
+    # data, the gradient passes straight through as in ste, and the returned set
+    # is snapped. Only the columns outside the one-hot groups, which belong to
+    # the one-hot modes above.
+    snapper = None
+    if bool(config.get("dm_snap", False)):
+        en_grupo = torch.zeros(input_dim, dtype=torch.bool, device=device)
+        for g, _, _ in OneHotProjector(X_train).groups:
+            en_grupo[g] = True
+        snapper = GridSnapper(X_train, torch.nonzero(~en_grupo).squeeze(1)) or None
+
     def vista(x, it):
         """The rows the embedder sees this iteration."""
         if onehot_mode == "ste":
-            return proj.ste(x)
-        if onehot_mode == "soft":
+            x = proj.ste(x)
+        elif onehot_mode == "soft":
             tau = tau0 * (tau1 / tau0) ** (it / max(iters, 1))
-            return proj.soft(x, tau)
+            x = proj.soft(x, tau)
+        if snapper is not None:
+            x = snapper.ste(x)
         return x
 
     def salida(x):
         """The rows that leave the loop: legal for the discrete modes, raw otherwise."""
         if onehot_mode in ("ste", "soft", "project"):
-            return proj.hard(x)
+            x = proj.hard(x)
+        if snapper is not None:
+            x = snapper.hard(x)
         return x
 
     # Precompute row indices per class once. The optimisation is class-wise, so
