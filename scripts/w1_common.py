@@ -61,8 +61,12 @@ MIXTOS = ["adult", "bank", "german", "law_school_admissions", "covertype",
           # columns, all binary; covertype is the only multi-class one
           "electricity", "airline_satisfaction", "road_safety", "medical_appointments",
           "hcdr", "airlines"]
+# Only one-hot groups: W1 and the snap have no column to act on, so on these the
+# full method is ste alone. Their distillations are in run_onehot_modes.py.
+SOLO_CAT = ["phishing", "car", "kropt", "nursery5", "splice"]
 BLOQUE = {**{d: "binario-sin" for d in BIN_SIN}, **{d: "multi-sin" for d in MULTI_SIN},
-          **{d: "mixto-binario" for d in MIXTOS if d != "covertype"}, "covertype": "mixto-multi"}
+          **{d: "mixto-binario" for d in MIXTOS if d != "covertype"}, "covertype": "mixto-multi",
+          "phishing": "cat-binario", **{d: "cat-multi" for d in SOLO_CAT if d != "phishing"}}
 
 _BAJADOS = {}
 
@@ -92,8 +96,24 @@ def _covertype(random_seed=42, device="cpu", max_rows=100_000):
                                  y.iloc[idx].reset_index(drop=True), random_seed, device)
 
 
+def _openml_cat(nombre, version, min_class=20):
+    """A purely categorical OpenML dataset, loaded as run_onehot_modes.py does:
+    classes with fewer than `min_class` rows are dropped so the stratified split
+    has rows of every class in every part."""
+    def prep(random_seed=42, device="cpu"):
+        ds = _bajar(nombre, version)
+        y = pd.Series(np.asarray(ds.target).ravel()).astype(str)
+        keep = (y.map(y.value_counts()).astype(int) >= min_class).values
+        return _preprocess_and_split(ds.data[keep].reset_index(drop=True),
+                                     y[keep].reset_index(drop=True), random_seed, device)
+    return prep
+
+
 register_tdbench_datasets()
 DATASET_REGISTRY.setdefault("covertype", _covertype)
+for _k, _a in {"car": ("car", 1), "nursery5": ("nursery", 1), "splice": ("splice", 1),
+               "kropt": ("kropt", 1, 60)}.items():
+    DATASET_REGISTRY.setdefault(_k, _openml_cat(*_a))
 
 
 def set_seed(s):
